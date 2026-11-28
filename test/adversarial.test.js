@@ -888,3 +888,71 @@ test('adversarial: concurrent checkpoint saves leave a loadable checkpoint', asy
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Adversarial: filesystem tool containment
+// ---------------------------------------------------------------------------
+
+test('adversarial: fs.read refuses path escapes outside allowedRoots (issue #6)', async () => {
+  const base = tmpDir('aegis-fuzz-fsread-');
+  const root = path.join(base, 'allowed');
+  const registry = buildDefaultRegistry();
+  const ctx = { allowedTools: ['fs.read'], allowedRoots: [root] };
+  try {
+    fs.mkdirSync(path.join(root, 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'ok.txt'), 'inside');
+    fs.writeFileSync(path.join(root, 'sub', 'nested.txt'), 'nested');
+    fs.writeFileSync(path.join(base, 'secret.txt'), 'TOP-SECRET');
+
+    // A read inside an allowed root still works — the control case.
+    assert.equal(await registry.run('fs.read', { path: path.join(root, 'ok.txt') }, ctx), 'inside');
+    assert.equal(await registry.run('fs.read', { path: path.join(root, 'sub', 'nested.txt') }, ctx), 'nested');
+
+    // The three escape shapes from issue #6: a `..` traversal, an absolute
+    // path outside the roots, and a nested `a/../../` traversal — each also
+    // written as a relative path, which `path.resolve` anchors at the
+    // working directory.
+    const escapes = [
+      path.join(root, '..', 'secret.txt'),
+      path.join(base, 'secret.txt'),
+      path.join(root, 'sub', '..', '..', 'secret.txt'),
+      path.relative(process.cwd(), path.join(base, 'secret.txt')),
+      '../secret.txt',
+      'a/../../secret.txt',
+    ];
+    for (const p of escapes) {
+      await assert.rejects(
+        () => registry.run('fs.read', { path: p }, ctx),
+        (err) => err.code === 'TOOL_DENIED',
+        `fs.read accepted an escape: ${JSON.stringify(p)}`,
+      );
+    }
+
+    // Seeded hostile paths: whatever the generator produces, a read must
+    // never return the secret, and must be refused or fail to resolve
+    // rather than touch a path outside the root.
+    const rng = makeRng(0xF5EAD);
+    for (let i = 0; i < 200; i++) {
+      const candidate = path.join(root, hostileId(rng));
+      let out = null;
+      try {
+        out = await registry.run('fs.read', { path: candidate }, ctx);
+      } catch (err) {
+        assert.ok(
+          err.code === 'TOOL_DENIED' || err.code === 'TOOL_ERROR',
+          `unexpected error code ${err.code} for ${JSON.stringify(candidate)}`,
+        );
+        continue;
+      }
+      // The only files inside the root a generated path can resolve to are
+      // the two planted ones; the secret must never come back.
+      assert.notEqual(out, 'TOP-SECRET', `fs.read leaked the secret via ${JSON.stringify(candidate)}`);
+      assert.ok(
+        out === 'inside' || out === 'nested',
+        `fs.read returned unexpected content via ${JSON.stringify(candidate)}`,
+      );
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
